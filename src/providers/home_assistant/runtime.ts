@@ -420,3 +420,16 @@ function normalizeBaseUrl(value: unknown): string {
 export function readInputString(value: unknown, fieldName: string): string {
   return requiredString(value, fieldName, (message) => new ProviderRequestError(400, message));
 }
+
+/**
+ * Reject an update that carries no field to change.
+ *
+ * Home Assistant merges the fields an update command is sent into the stored
+ * item, so a request naming only its target silently succeeds without changing
+ * anything, which a caller reads as a completed edit.
+ */
+export function requireHomeAssistantChanges(changes: Record<string, unknown>, fieldNames: string): void {
+  if (Object.keys(changes).length === 0) {
+    throw badHomeAssistantRequest(`At least one of ${fieldNames} is required`);
+  }
+}

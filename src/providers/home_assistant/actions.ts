@@ -75,6 +75,59 @@ const searchItemTypes: string[] = [
   "script_blueprint",
 ];
 
+// The recorder statistics vocabulary: the kinds of statistic a sensor produces,
+// the bucket sizes the recorder can aggregate into, and the value columns a row
+// can carry. Which columns are populated depends on the statistic kind, so a
+// mean statistic has no sum and a sum statistic has no mean.
+const statisticTypes: string[] = ["mean", "sum"];
+const statisticPeriods: string[] = ["5minute", "hour", "day", "week", "month", "year"];
+const statisticValueTypes: string[] = ["change", "last_reset", "max", "mean", "min", "state", "sum"];
+
+const statisticRowSchema = s.looseObject(
+  "One aggregated Home Assistant statistics row. Start and end are Unix timestamps in milliseconds.",
+  {
+    start: s.number("The bucket start as a Unix timestamp in milliseconds."),
+    end: s.number("The bucket end as a Unix timestamp in milliseconds."),
+  },
+);
+
+// The registry write commands share four traits worth stating on every action
+// that has them: they need an admin token, they replace list fields instead of
+// merging them, they store references to areas, floors, and labels without
+// checking that those exist, and Home Assistant reports an unknown target id
+// from most of them as a bare unknown error rather than a not-found.
+const registryAdminNote = "Requires an admin access token.";
+const registryReplaceNote = "List fields replace the stored list rather than adding to it, so send the full list.";
+const registryDanglingNote =
+  "Home Assistant stores this reference without checking that it exists, so create the target first and verify it.";
+const registryUnknownIdNote = "An id that does not exist is reported as an unknown Home Assistant error.";
+const registryNameNote =
+  "Names are unique once case and spaces are ignored, so Living Room and livingroom collide and the second one is rejected.";
+const registryGeneratedIdNote =
+  "Home Assistant generates the id from the name, so read it from this result rather than guessing it.";
+// Home Assistant validates the colour against a closed set: its theme colour
+// names, or a hex code. Anything else is rejected with a message that only
+// mentions the hex form, so the names are spelled out here.
+const labelColorNote =
+  "This is either a #RRGGBB hex code or one of the theme colour names: primary, accent, disabled, red, pink, purple, deep-purple, indigo, blue, light-blue, cyan, teal, green, light-green, lime, yellow, amber, orange, deep-orange, brown, light-grey, grey, dark-grey, blue-grey, black, white.";
+
+// Every Lovelace write command is admin-gated, and dashboards defined in YAML
+// reject them outright because their configuration lives in a file Home
+// Assistant does not manage.
+const lovelaceAdminNote =
+  "Requires an admin access token, and only works on dashboards Home Assistant stores itself; a dashboard defined in YAML is rejected.";
+const lovelaceDefaultDashboardNote =
+  "Omit the url path to target the default dashboard, which is the one served at /lovelace.";
+
+const lovelaceResourceTypes: string[] = ["css", "html", "js", "module"];
+
+const lovelaceUrlPathSchema = s.nonEmptyString(
+  "The url path of the dashboard, as listed by list_lovelace_dashboards. Omit it for the default dashboard.",
+);
+const lovelaceDashboardIdSchema = s.nonEmptyString(
+  "The dashboard id, as returned by list_lovelace_dashboards or create_lovelace_dashboard. This is not the url path: Home Assistant slugifies the url path with underscores to build it.",
+);
+
 function registryListSchema(description: string): JsonSchema {
   return s.nullable(s.array(description, s.looseObject("One Home Assistant registry entry.")));
 }
@@ -526,6 +579,492 @@ export const homeAssistantActions: ActionDefinition[] = [
     description: `Delete one Home Assistant scene. ${configAdminNote}`,
     inputSchema: configKeyInput("sceneId", "The scene id to delete."),
     outputSchema: configWriteResultSchema,
+  }),
+  defineProviderAction(service, {
+    name: "list_statistic_ids",
+    description:
+      "List the long-term statistics Home Assistant records, with the unit and whether each one is a mean or a sum. Long-term statistics are kept far longer than the state history, so this is where multi-week energy, power, and temperature trends live.",
+    followUpActions: ["home_assistant.get_statistics"],
+    inputSchema: s.actionInput(
+      {
+        statisticType: s.stringEnum(
+          "Only list statistics of this kind. Omit to list every recorded statistic.",
+          statisticTypes,
+        ),
+      },
+      [],
+      "Input parameters for listing Home Assistant statistic ids.",
+    ),
+    outputSchema: s.actionOutput(
+      {
+        statisticIds: s.array(
+          "The recorded statistics, each with its statistic_id, source, units, and whether it carries a sum. Read mean_type, an integer where 0 is none, 1 arithmetic, and 2 circular, rather than the deprecated has_mean flag.",
+          s.looseObject("One Home Assistant statistic metadata entry."),
+        ),
+      },
+      "The Home Assistant long-term statistics catalog.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "get_statistics_metadata",
+    description:
+      "Fetch the recording metadata for specific long-term statistics, including the unit the values are stored in and whether the statistic carries mean or sum values.",
+    followUpActions: ["home_assistant.get_statistics"],
+    inputSchema: s.actionInput(
+      {
+        statisticIds: s.array(
+          "The statistic ids to describe. Omit to describe every recorded statistic.",
+          s.nonEmptyString("One Home Assistant statistic id, usually the entity id it is recorded for."),
+        ),
+      },
+      [],
+      "Input parameters for one Home Assistant statistics metadata query.",
+    ),
+    outputSchema: s.actionOutput(
+      {
+        metadata: s.array(
+          "The statistics metadata entries.",
+          s.looseObject("One Home Assistant statistic metadata entry."),
+        ),
+      },
+      "The Home Assistant statistics metadata.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "get_statistics",
+    description:
+      "Fetch aggregated long-term statistics for one or more statistic ids, bucketed by five minutes, hour, day, week, month, or year. Prefer this over get_history for questions spanning more than a day or two: the recorder keeps only a few days of raw states but keeps these aggregates for years. Which value columns a row carries depends on the statistic: a sum statistic such as an energy meter returns state, sum, and change, while a mean statistic such as a temperature returns mean, min, and max.",
+    inputSchema: s.actionInput(
+      {
+        statisticIds: s.array(
+          "The statistic ids to fetch, as returned by list_statistic_ids. Ids that are not recorded are omitted from the result rather than reported as an error.",
+          s.nonEmptyString("One Home Assistant statistic id."),
+          { minItems: 1 },
+        ),
+        startTime: s.dateTime(
+          "The inclusive start of the period. Include an explicit UTC offset or Z: Home Assistant reads a timestamp without one in its own local time zone.",
+        ),
+        endTime: s.dateTime(
+          "The exclusive end of the period. Omitting this returns everything recorded since the start time, with no upper bound, which can be an enormous payload on a long-lived instance.",
+        ),
+        period: s.stringEnum(
+          "The bucket size the statistics are aggregated into. For day, week, month, and year Home Assistant snaps the window outwards to local calendar boundaries, so the first and last buckets can fall outside the requested range.",
+          statisticPeriods,
+        ),
+        types: s.array(
+          "The value types to return. Home Assistant returns every type the statistic supports when omitted, and returns only start and end for an explicitly empty list.",
+          s.stringEnum("One Home Assistant statistic value type.", statisticValueTypes),
+        ),
+        units: s.looseObject(
+          "Optional unit conversion, keyed by unit class such as energy, power, temperature, or volume, with the unit to convert to as the value. Without this, values come back in the entity's current display unit, so the same query can change magnitude after a user changes that unit.",
+        ),
+      },
+      ["statisticIds", "startTime", "period"],
+      "Input parameters for one Home Assistant long-term statistics query.",
+    ),
+    outputSchema: s.actionOutput(
+      {
+        statistics: s.record(
+          s.array("The statistic rows for one statistic id, ordered by start time.", statisticRowSchema),
+          {
+            description: "The statistics rows keyed by statistic id. A statistic with no data in the period is absent.",
+          },
+        ),
+      },
+      "The Home Assistant long-term statistics for the requested period.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "get_entity_registry_entry",
+    description:
+      "Fetch the registry entry for one entity, which is the editable layer over it: its name override, icon, area, labels, voice aliases, and per-integration options. Read this before update_entity_registry_entry, because the list and options fields are replaced wholesale rather than merged.",
+    followUpActions: ["home_assistant.update_entity_registry_entry"],
+    inputSchema: entityInputSchema,
+    outputSchema: s.actionOutput(
+      { entry: s.looseObject("The entity registry entry.") },
+      "The Home Assistant entity registry entry.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_entity_registry_entry",
+    description: `Update the editable registry fields of one entity: its displayed name, icon, area, labels, voice aliases, device class, and per-integration options. Fields left out keep their current values, and null resets a field to the integration default. ${registryReplaceNote} ${registryAdminNote} This cannot rename the entity id, enable, or disable an entity.`,
+    followUpActions: ["home_assistant.get_entity_registry_entry"],
+    inputSchema: s.actionInput(
+      {
+        entityId: s.nonEmptyString("The entity to update, for example light.living_room."),
+        name: s.nullableString("The displayed name, or null to fall back to the integration's own name."),
+        icon: s.nullableString("The icon, for example mdi:lamp, or null to fall back to the default icon."),
+        areaId: s.nullableString(
+          `The area to place the entity in, or null to remove it from its area. ${registryDanglingNote}`,
+        ),
+        deviceClass: s.nullableString(
+          "The device class override, for example temperature, or null to fall back to the integration's own device class.",
+        ),
+        hiddenBy: s.nullable(
+          s.stringEnum(
+            "Set to user to hide the entity from the dashboards and voice assistants, or null to unhide it. Hiding keeps the entity recording, unlike disabling it.",
+            ["user"],
+          ),
+        ),
+        aliases: s.array(
+          `The complete list of voice assistant aliases, replacing the stored list. Send an empty list to clear them. ${registryReplaceNote}`,
+          s.nonEmptyString("One alias for the entity."),
+        ),
+        labels: s.array(
+          `The complete list of label ids, replacing the stored list. Send an empty list to clear them. ${registryDanglingNote}`,
+          s.nonEmptyString("One label id."),
+        ),
+        optionsDomain: s.nonEmptyString(
+          "The integration domain the options belong to, for example sensor. Required when options is sent.",
+        ),
+        options: s.nullable(
+          s.looseObject(
+            "The complete options object for that domain, such as display_precision for a sensor, replacing everything stored for the domain. Null removes the domain's options. Required when optionsDomain is sent.",
+          ),
+        ),
+      },
+      ["entityId"],
+      "Input parameters for updating one Home Assistant entity registry entry. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput(
+      { entry: s.looseObject("The updated entity registry entry.") },
+      "The updated Home Assistant entity registry entry.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_device_registry_entry",
+    description: `Update the editable registry fields of one device: the name shown to users, its area, and its labels. Moving a device to an area is what gives its entities an area, so prefer this over updating each entity. ${registryAdminNote} ${registryUnknownIdNote}`,
+    inputSchema: s.actionInput(
+      {
+        deviceId: s.nonEmptyString("The device registry id, as returned by get_registries."),
+        nameByUser: s.nullableString(
+          "The name shown to users, or null to fall back to the name the integration reports. The integration's own name cannot be changed.",
+        ),
+        areaId: s.nullableString(
+          `The area to place the device in, or null to remove it from its area. ${registryDanglingNote}`,
+        ),
+        labels: s.array(
+          `The complete list of label ids, replacing the stored list. Send an empty list to clear them. ${registryDanglingNote}`,
+          s.nonEmptyString("One label id."),
+        ),
+      },
+      ["deviceId"],
+      "Input parameters for updating one Home Assistant device registry entry. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput(
+      { entry: s.looseObject("The updated device registry entry.") },
+      "The updated Home Assistant device registry entry.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "create_area",
+    description: `Create one area, which is how Home Assistant groups devices and entities by room. ${registryNameNote} ${registryAdminNote}`,
+    followUpActions: ["home_assistant.update_device_registry_entry"],
+    inputSchema: s.actionInput(
+      {
+        name: s.nonEmptyString("The area name, for example Living Room."),
+        floorId: s.nonEmptyString(`The floor the area belongs to. ${registryDanglingNote}`),
+        icon: s.nonEmptyString("The area icon, for example mdi:sofa."),
+        picture: s.nullableString("A url to a picture representing the area."),
+        aliases: s.array("Voice assistant aliases for the area.", s.nonEmptyString("One alias for the area.")),
+        labels: s.array(`The label ids to attach. ${registryDanglingNote}`, s.nonEmptyString("One label id.")),
+        temperatureEntityId: s.nullableString("The entity whose reading represents the area temperature."),
+        humidityEntityId: s.nullableString("The entity whose reading represents the area humidity."),
+      },
+      ["name"],
+      "Input parameters for creating one Home Assistant area.",
+    ),
+    outputSchema: s.actionOutput(
+      { entry: s.looseObject(`The created area. ${registryGeneratedIdNote}`) },
+      "The created Home Assistant area.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_area",
+    description: `Update one area's name, floor, icon, aliases, labels, or the entities that report its temperature and humidity. Fields left out keep their current values. ${registryNameNote} ${registryAdminNote} ${registryUnknownIdNote}`,
+    inputSchema: s.actionInput(
+      {
+        areaId: s.nonEmptyString("The area id, as returned by get_registries. Renaming an area does not change it."),
+        name: s.nonEmptyString("The new area name."),
+        floorId: s.nullableString(
+          `The floor the area belongs to, or null to detach it from its floor. ${registryDanglingNote}`,
+        ),
+        icon: s.nullableString("The area icon, or null to remove it."),
+        picture: s.nullableString("A url to a picture representing the area, or null to remove it."),
+        aliases: s.array(
+          `The complete list of voice assistant aliases, replacing the stored list. ${registryReplaceNote}`,
+          s.nonEmptyString("One alias for the area."),
+        ),
+        labels: s.array(
+          `The complete list of label ids, replacing the stored list. ${registryDanglingNote}`,
+          s.nonEmptyString("One label id."),
+        ),
+        temperatureEntityId: s.nullableString(
+          "The entity whose reading represents the area temperature, or null to unset it.",
+        ),
+        humidityEntityId: s.nullableString(
+          "The entity whose reading represents the area humidity, or null to unset it.",
+        ),
+      },
+      ["areaId"],
+      "Input parameters for updating one Home Assistant area. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput({ entry: s.looseObject("The updated area.") }, "The updated Home Assistant area."),
+  }),
+  defineProviderAction(service, {
+    name: "create_floor",
+    description: `Create one floor, which groups areas into storeys of the building. ${registryNameNote} ${registryAdminNote}`,
+    followUpActions: ["home_assistant.update_area"],
+    inputSchema: s.actionInput(
+      {
+        name: s.nonEmptyString("The floor name, for example Ground Floor."),
+        level: s.nullableInteger("The storey number, where 0 is the ground floor and negative numbers are basements."),
+        icon: s.nullableString("The floor icon, for example mdi:home-floor-g."),
+        aliases: s.array("Voice assistant aliases for the floor.", s.nonEmptyString("One alias for the floor.")),
+      },
+      ["name"],
+      "Input parameters for creating one Home Assistant floor.",
+    ),
+    outputSchema: s.actionOutput(
+      { entry: s.looseObject(`The created floor. ${registryGeneratedIdNote}`) },
+      "The created Home Assistant floor.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_floor",
+    description: `Update one floor's name, storey level, icon, or aliases. Fields left out keep their current values. ${registryNameNote} ${registryAdminNote} ${registryUnknownIdNote}`,
+    inputSchema: s.actionInput(
+      {
+        floorId: s.nonEmptyString("The floor id, as returned by get_registries."),
+        name: s.nonEmptyString("The new floor name."),
+        level: s.nullableInteger("The storey number, or null to unset it."),
+        icon: s.nullableString("The floor icon, or null to remove it."),
+        aliases: s.array(
+          `The complete list of voice assistant aliases, replacing the stored list. ${registryReplaceNote}`,
+          s.nonEmptyString("One alias for the floor."),
+        ),
+      },
+      ["floorId"],
+      "Input parameters for updating one Home Assistant floor. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput({ entry: s.looseObject("The updated floor.") }, "The updated Home Assistant floor."),
+  }),
+  defineProviderAction(service, {
+    name: "create_label",
+    description: `Create one label. Labels cut across areas and devices, and service calls can target every entity carrying one, which makes them the way to build ad hoc groups. ${registryNameNote} ${registryAdminNote}`,
+    followUpActions: ["home_assistant.update_entity_registry_entry"],
+    inputSchema: s.actionInput(
+      {
+        name: s.nonEmptyString("The label name."),
+        color: s.nullableString(`The label colour shown in the interface. ${labelColorNote}`),
+        description: s.nullableString("What the label is for."),
+        icon: s.nullableString("The label icon, for example mdi:tag."),
+      },
+      ["name"],
+      "Input parameters for creating one Home Assistant label.",
+    ),
+    outputSchema: s.actionOutput(
+      { entry: s.looseObject(`The created label. ${registryGeneratedIdNote}`) },
+      "The created Home Assistant label.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_label",
+    description: `Update one label's name, colour, description, or icon. Fields left out keep their current values. ${registryNameNote} ${registryAdminNote} ${registryUnknownIdNote}`,
+    inputSchema: s.actionInput(
+      {
+        labelId: s.nonEmptyString("The label id, as returned by get_registries."),
+        name: s.nonEmptyString("The new label name."),
+        color: s.nullableString(`The label colour, or null to remove it. ${labelColorNote}`),
+        description: s.nullableString("What the label is for, or null to remove the description."),
+        icon: s.nullableString("The label icon, or null to remove it."),
+      },
+      ["labelId"],
+      "Input parameters for updating one Home Assistant label. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput({ entry: s.looseObject("The updated label.") }, "The updated Home Assistant label."),
+  }),
+  defineProviderAction(service, {
+    name: "get_lovelace_config",
+    description: `Fetch the stored configuration of one Lovelace dashboard, which holds its views, cards, and their options. ${lovelaceDefaultDashboardNote} A dashboard rendered by a strategy, including the auto-generated default one, has no stored configuration until something saves one.`,
+    followUpActions: ["home_assistant.save_lovelace_config"],
+    inputSchema: s.actionInput(
+      {
+        urlPath: lovelaceUrlPathSchema,
+        force: s.boolean("Bypass the cached configuration and reread it from storage."),
+      },
+      [],
+      "Input parameters for reading one Home Assistant dashboard configuration.",
+    ),
+    outputSchema: s.actionOutput(
+      { config: s.looseObject("The stored dashboard configuration, normally with a views list.") },
+      "The stored Home Assistant dashboard configuration.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "save_lovelace_config",
+    description: `Replace the stored configuration of one Lovelace dashboard. This overwrites the whole document rather than merging, so read the current configuration with get_lovelace_config, change what is needed, and send the complete result back. Everything omitted is lost. ${lovelaceAdminNote} ${lovelaceDefaultDashboardNote}`,
+    followUpActions: ["home_assistant.get_lovelace_config"],
+    inputSchema: s.actionInput(
+      {
+        urlPath: lovelaceUrlPathSchema,
+        config: s.looseObject("The complete dashboard configuration to store, normally with a views list."),
+      },
+      ["config"],
+      "Input parameters for replacing one Home Assistant dashboard configuration.",
+    ),
+    outputSchema: s.actionOutput(
+      { saved: s.literal(true, { description: "Whether Home Assistant stored the dashboard configuration." }) },
+      "The Home Assistant dashboard save result.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "delete_lovelace_config",
+    description: `Delete the stored configuration of one Lovelace dashboard, which reverts it to the automatically generated view. The dashboard itself stays in the sidebar; use delete_lovelace_dashboard to remove it entirely. ${lovelaceAdminNote} ${lovelaceDefaultDashboardNote}`,
+    inputSchema: s.actionInput(
+      { urlPath: lovelaceUrlPathSchema },
+      [],
+      "Input parameters for deleting one Home Assistant dashboard configuration.",
+    ),
+    outputSchema: s.actionOutput(
+      { deleted: s.literal(true, { description: "Whether Home Assistant deleted the dashboard configuration." }) },
+      "The Home Assistant dashboard configuration delete result.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "list_lovelace_dashboards",
+    description:
+      "List the Lovelace dashboards registered on the instance. Entries defined in YAML carry a filename and no id; only entries with an id can be updated, deleted, or given a stored configuration.",
+    followUpActions: ["home_assistant.get_lovelace_config"],
+    inputSchema: emptyInputSchema,
+    outputSchema: s.actionOutput(
+      {
+        dashboards: s.array(
+          "The registered dashboards, each with its url_path, title, mode, and, for editable ones, its id.",
+          s.looseObject("One Home Assistant dashboard entry."),
+        ),
+      },
+      "The Home Assistant Lovelace dashboards.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "create_lovelace_dashboard",
+    description: `Create one Lovelace dashboard and add it to the sidebar. It starts with no stored configuration, so follow up with save_lovelace_config to give it views. ${lovelaceAdminNote}`,
+    followUpActions: ["home_assistant.save_lovelace_config"],
+    inputSchema: s.actionInput(
+      {
+        urlPath: s.nonEmptyString(
+          "The url path the dashboard is served at, which must contain a hyphen, for example energy-detail.",
+        ),
+        title: s.nonEmptyString("The dashboard title shown in the sidebar."),
+        icon: s.nonEmptyString("The optional sidebar icon, for example mdi:home."),
+        showInSidebar: s.boolean("Whether the dashboard appears in the sidebar. Home Assistant defaults this to true."),
+        requireAdmin: s.boolean("Whether only admin users may open the dashboard."),
+      },
+      ["urlPath", "title"],
+      "Input parameters for creating one Home Assistant dashboard.",
+    ),
+    outputSchema: s.actionOutput(
+      {
+        dashboard: s.looseObject(
+          "The created dashboard entry. Its id is a slugified form of the url path with underscores, and is what the update and delete actions take.",
+        ),
+      },
+      "The created Home Assistant dashboard.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_lovelace_dashboard",
+    description: `Update the sidebar presentation of one Lovelace dashboard. Fields left out keep their current values, and a null icon removes the icon. This does not touch the dashboard's views; use save_lovelace_config for those. ${lovelaceAdminNote}`,
+    inputSchema: s.actionInput(
+      {
+        dashboardId: lovelaceDashboardIdSchema,
+        title: s.nonEmptyString("The new dashboard title."),
+        icon: s.nullableString("The new sidebar icon, or null to remove the current one."),
+        showInSidebar: s.boolean("Whether the dashboard appears in the sidebar."),
+        requireAdmin: s.boolean("Whether only admin users may open the dashboard."),
+      },
+      ["dashboardId"],
+      "Input parameters for updating one Home Assistant dashboard. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput(
+      { dashboard: s.looseObject("The updated dashboard entry.") },
+      "The updated Home Assistant dashboard.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "delete_lovelace_dashboard",
+    description: `Delete one Lovelace dashboard together with its stored views. This is not reversible, and the views are not recoverable from Home Assistant afterwards, so read them with get_lovelace_config first if they may be needed. ${lovelaceAdminNote}`,
+    inputSchema: s.actionInput(
+      { dashboardId: lovelaceDashboardIdSchema },
+      ["dashboardId"],
+      "Input parameters for deleting one Home Assistant dashboard.",
+    ),
+    outputSchema: s.actionOutput(
+      { deleted: s.literal(true, { description: "Whether Home Assistant deleted the dashboard." }) },
+      "The Home Assistant dashboard delete result.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "list_lovelace_resources",
+    description:
+      "List the frontend resources Home Assistant loads for dashboards, which is how custom cards are registered.",
+    inputSchema: emptyInputSchema,
+    outputSchema: s.actionOutput(
+      {
+        resources: s.array(
+          "The registered frontend resources, each with its id, url, and type.",
+          s.looseObject("One Home Assistant frontend resource."),
+        ),
+      },
+      "The Home Assistant frontend resources.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "create_lovelace_resource",
+    description: `Register one frontend resource so dashboards can use the custom cards it defines. The file has to already be reachable from Home Assistant, normally under /local. ${lovelaceAdminNote}`,
+    inputSchema: s.actionInput(
+      {
+        resourceType: s.stringEnum("How the frontend loads the resource.", lovelaceResourceTypes),
+        url: s.nonEmptyString("The url Home Assistant loads the resource from, for example /local/my-card.js."),
+      },
+      ["resourceType", "url"],
+      "Input parameters for registering one Home Assistant frontend resource.",
+    ),
+    outputSchema: s.actionOutput(
+      { resource: s.looseObject("The created frontend resource. Its type is reported as type, not res_type.") },
+      "The created Home Assistant frontend resource.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "update_lovelace_resource",
+    description: `Update the url or load type of one registered frontend resource. Fields left out keep their current values. ${lovelaceAdminNote}`,
+    inputSchema: s.actionInput(
+      {
+        resourceId: s.nonEmptyString("The resource id, as returned by list_lovelace_resources."),
+        resourceType: s.stringEnum("How the frontend loads the resource.", lovelaceResourceTypes),
+        url: s.nonEmptyString("The url Home Assistant loads the resource from."),
+      },
+      ["resourceId"],
+      "Input parameters for updating one Home Assistant frontend resource. At least one changed field is required.",
+    ),
+    outputSchema: s.actionOutput(
+      { resource: s.looseObject("The updated frontend resource.") },
+      "The updated Home Assistant frontend resource.",
+    ),
+  }),
+  defineProviderAction(service, {
+    name: "delete_lovelace_resource",
+    description: `Remove one registered frontend resource. Dashboards using the custom cards it defines stop rendering them. ${lovelaceAdminNote}`,
+    inputSchema: s.actionInput(
+      { resourceId: s.nonEmptyString("The resource id, as returned by list_lovelace_resources.") },
+      ["resourceId"],
+      "Input parameters for removing one Home Assistant frontend resource.",
+    ),
+    outputSchema: s.actionOutput(
+      { deleted: s.literal(true, { description: "Whether Home Assistant removed the frontend resource." }) },
+      "The Home Assistant frontend resource delete result.",
+    ),
   }),
   defineProviderAction(service, {
     name: "check_config",

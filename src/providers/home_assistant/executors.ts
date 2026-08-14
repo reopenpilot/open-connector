@@ -4,6 +4,9 @@ import type { HomeAssistantActionContext } from "./runtime.ts";
 import { isPrivateNetworkAccessAllowed } from "../../core/request.ts";
 import { defineProviderExecutors, requireApiKeyCredential } from "../provider-runtime.ts";
 import { homeAssistantConfigActionHandlers } from "./runtime-config.ts";
+import { homeAssistantLovelaceActionHandlers } from "./runtime-lovelace.ts";
+import { homeAssistantRegistryActionHandlers } from "./runtime-registry.ts";
+import { homeAssistantStatisticsActionHandlers } from "./runtime-statistics.ts";
 import { homeAssistantWebSocketActionHandlers } from "./runtime-ws.ts";
 import {
   homeAssistantActionHandlers,
@@ -18,6 +21,9 @@ export const executors: ProviderExecutors = defineProviderExecutors<HomeAssistan
   handlers: {
     ...homeAssistantActionHandlers,
     ...homeAssistantConfigActionHandlers,
+    ...homeAssistantLovelaceActionHandlers,
+    ...homeAssistantRegistryActionHandlers,
+    ...homeAssistantStatisticsActionHandlers,
     ...homeAssistantWebSocketActionHandlers,
   },
   allowPrivateNetwork: isPrivateNetworkAccessAllowed,

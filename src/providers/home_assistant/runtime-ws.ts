@@ -1,12 +1,10 @@
 import type { GuardedWebSocketFailure, WebSocketLike } from "../../core/guarded-websocket.ts";
-import type { HomeAssistantRegistryName } from "./actions.ts";
 import type { HomeAssistantActionContext, HomeAssistantActionHandler } from "./runtime.ts";
 
 import { compactObject, objectArray, optionalRecord, optionalString } from "../../core/cast.ts";
 import { openGuardedWebSocket } from "../../core/guarded-websocket.ts";
 import { isPrivateNetworkAccessAllowed } from "../../core/request.ts";
 import { ProviderRequestError } from "../provider-runtime.ts";
-import { homeAssistantRegistryNames } from "./actions.ts";
 import { readInputString } from "./runtime.ts";
 
 /**
@@ -15,42 +13,13 @@ import { readInputString } from "./runtime.ts";
  */
 const homeAssistantWebSocketTimeoutMs = 30_000;
 
-const registryCommandTypes: Record<HomeAssistantRegistryName, string> = {
-  entities: "config/entity_registry/list",
-  devices: "config/device_registry/list",
-  areas: "config/area_registry/list",
-  floors: "config/floor_registry/list",
-  labels: "config/label_registry/list",
-};
-
 /** One Home Assistant WebSocket command, without the connection-assigned `id`. */
-interface HomeAssistantCommand {
+export interface HomeAssistantCommand {
   type: string;
   [key: string]: unknown;
 }
 
 export const homeAssistantWebSocketActionHandlers: Record<string, HomeAssistantActionHandler> = {
-  async get_registries(input, context) {
-    const requested = readRegistryNames(input.include);
-    const results = await runHomeAssistantCommands(
-      context,
-      requested.map((name) => ({ type: registryCommandTypes[name] })),
-    );
-
-    // Registries the caller did not ask for stay null so an omitted registry is
-    // distinguishable from one the instance genuinely has no entries for.
-    const output: Record<HomeAssistantRegistryName, unknown> = {
-      entities: null,
-      devices: null,
-      areas: null,
-      floors: null,
-      labels: null,
-    };
-    requested.forEach((name, index) => {
-      output[name] = results[index] ?? [];
-    });
-    return output;
-  },
   async search_related(input, context) {
     const [related] = await runHomeAssistantCommands(context, [
       {
@@ -107,7 +76,7 @@ export const homeAssistantWebSocketActionHandlers: Record<string, HomeAssistantA
  * before any command can be sent; batching keeps a multi-registry action at one
  * handshake instead of one per registry.
  */
-async function runHomeAssistantCommands(
+export async function runHomeAssistantCommands(
   context: HomeAssistantActionContext,
   commands: HomeAssistantCommand[],
 ): Promise<unknown[]> {
@@ -329,37 +298,27 @@ function createCommandError(error: unknown, commandType: string): ProviderReques
   if (code === "unauthorized") {
     return new ProviderRequestError(403, message);
   }
-  if (code === "not_found" || code === "unknown_command") {
+  if (
+    code === "not_found" ||
+    code === "unknown_command" ||
+    code === "unknown_statistic_id" ||
+    code === "config_not_found"
+  ) {
     return new ProviderRequestError(404, message);
   }
-  if (code === "invalid_format" || code === "id_reuse") {
+  // Home Assistant spells its per-command input rejections as invalid_<field>,
+  // such as invalid_format, invalid_start_time, and invalid_info.
+  if (code?.startsWith("invalid_") || code === "id_reuse") {
+    return new ProviderRequestError(400, message);
+  }
+  // Lovelace has no code of its own for "this dashboard cannot be edited" or
+  // "that url is taken": both arrive as the generic runtime-failure codes,
+  // carrying the reason in the message. Elsewhere those same codes really do
+  // mean the instance failed, so they only count as a rejection here.
+  if (commandType.startsWith("lovelace/") && (code === "error" || code === "home_assistant_error")) {
     return new ProviderRequestError(400, message);
   }
   return new ProviderRequestError(502, message);
-}
-
-function readRegistryNames(value: unknown): HomeAssistantRegistryName[] {
-  if (value === undefined || value === null) {
-    return homeAssistantRegistryNames;
-  }
-  if (!Array.isArray(value)) {
-    throw new ProviderRequestError(400, "include must be an array of registry names");
-  }
-  if (value.length === 0) {
-    return homeAssistantRegistryNames;
-  }
-
-  const selected: HomeAssistantRegistryName[] = [];
-  for (const entry of value) {
-    const name = homeAssistantRegistryNames.find((candidate) => candidate === entry);
-    if (!name) {
-      throw new ProviderRequestError(400, `include must only contain ${homeAssistantRegistryNames.join(", ")}`);
-    }
-    if (!selected.includes(name)) {
-      selected.push(name);
-    }
-  }
-  return selected;
 }
 
 function readOptionalConfigList(value: unknown, fieldName: string): Array<Record<string, unknown>> | undefined {
