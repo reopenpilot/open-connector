@@ -1,4 +1,4 @@
-import type { HomeAssistantActionHandler } from "./runtime.ts";
+import type { HomeAssistantActionContext, HomeAssistantActionHandler } from "./runtime.ts";
 
 import {
   compactObject,
@@ -10,7 +10,12 @@ import {
 } from "../../core/cast.ts";
 import { ProviderRequestError } from "../provider-runtime.ts";
 import { runHomeAssistantCommands } from "./runtime-ws.ts";
-import { badHomeAssistantRequest, readInputString, requireHomeAssistantChanges } from "./runtime.ts";
+import {
+  assertStoredConfigMatches,
+  badHomeAssistantRequest,
+  readInputString,
+  requireHomeAssistantChanges,
+} from "./runtime.ts";
 
 export const homeAssistantLovelaceActionHandlers: Record<string, HomeAssistantActionHandler> = {
   async get_lovelace_config(input, context) {
@@ -40,11 +45,26 @@ export const homeAssistantLovelaceActionHandlers: Record<string, HomeAssistantAc
     }
   },
   async save_lovelace_config(input, context) {
+    const urlPath = optionalString(input.urlPath);
+    const previousConfig = requiredRecord(input.previousConfig, "previousConfig", badHomeAssistantRequest);
+    const config = requiredRecord(input.config, "config", badHomeAssistantRequest);
+
+    // Home Assistant replaces the stored document wholesale and has no version
+    // or etag to check, so a caller that never read the dashboard would silently
+    // drop every view it did not happen to include. Require the current document
+    // to be handed back, and refuse the write unless it still matches.
+    assertStoredConfigMatches({
+      stored: await readStoredLovelaceConfig(context, urlPath),
+      previous: previousConfig,
+      subject: "this dashboard",
+      readActionName: "get_lovelace_config",
+    });
+
     await runHomeAssistantCommands(context, [
       {
         type: "lovelace/config/save",
-        config: requiredRecord(input.config, "config", badHomeAssistantRequest),
-        ...compactObject({ url_path: optionalString(input.urlPath) }),
+        config,
+        ...compactObject({ url_path: urlPath }),
       },
     ]);
     return { saved: true };
@@ -146,3 +166,28 @@ export const homeAssistantLovelaceActionHandlers: Record<string, HomeAssistantAc
     return { deleted: true };
   },
 };
+
+/**
+ * Read the configuration a dashboard currently stores, treating "nothing stored"
+ * as an empty document.
+ *
+ * A dashboard that has never been saved and a url path that does not exist both
+ * report the same not-found, and they do not need to be told apart here: the
+ * save that follows rejects an unknown dashboard on its own.
+ */
+async function readStoredLovelaceConfig(
+  context: HomeAssistantActionContext,
+  urlPath: string | undefined,
+): Promise<Record<string, unknown>> {
+  try {
+    const [config] = await runHomeAssistantCommands(context, [
+      { type: "lovelace/config", ...compactObject({ url_path: urlPath }) },
+    ]);
+    return optionalRecord(config) ?? {};
+  } catch (error) {
+    if (error instanceof ProviderRequestError && error.status === 404) {
+      return {};
+    }
+    throw error;
+  }
+}

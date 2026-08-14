@@ -433,3 +433,83 @@ export function requireHomeAssistantChanges(changes: Record<string, unknown>, fi
     throw badHomeAssistantRequest(`At least one of ${fieldNames} is required`);
   }
 }
+
+/** One check that a stored document is still the one the caller read. */
+export interface StoredConfigMatchInput {
+  /** The document the instance currently stores, or an empty object when it stores none. */
+  stored: Record<string, unknown>;
+  /** The document the caller says it read, sent back as `previousConfig`. */
+  previous: Record<string, unknown>;
+  /** What is being written, named as it reads in a sentence, such as "this automation". */
+  subject: string;
+  /** The action that returns the document, so a rejected caller knows how to recover. */
+  readActionName: string;
+}
+
+/**
+ * Refuse a write unless the document the caller read is still the stored one.
+ *
+ * Home Assistant replaces these documents wholesale and offers no version or
+ * etag to check against, so a caller that never read one would silently drop
+ * everything it did not happen to include. Requiring the current document back
+ * makes a write issued without a read impossible, and turns a write that races
+ * another edit into a rejection instead of a silent overwrite.
+ */
+export function assertStoredConfigMatches(input: StoredConfigMatchInput): void {
+  const difference = findFirstConfigDifference(input.stored, input.previous);
+  if (difference) {
+    throw new ProviderRequestError(
+      409,
+      `previousConfig does not match what ${input.subject} currently stores; they first differ at ${difference}. Read it again with ${input.readActionName}, reapply the change to what it returns, and send that as previousConfig.`,
+    );
+  }
+}
+
+/**
+ * Describe where the stored document and the one the caller says it read first
+ * differ, or return undefined when they carry the same content.
+ *
+ * Object keys are compared as a set, because a caller that reserialises the
+ * document it read may order them differently. Array order is content, so the
+ * order of views, cards, and automation steps is compared position by position.
+ */
+function findFirstConfigDifference(stored: unknown, expected: unknown, path = "config"): string | undefined {
+  if (Array.isArray(stored) || Array.isArray(expected)) {
+    if (!Array.isArray(stored) || !Array.isArray(expected)) {
+      return path;
+    }
+    if (stored.length !== expected.length) {
+      return `${path} (${stored.length} stored, ${expected.length} in previousConfig)`;
+    }
+    for (const [index, entry] of stored.entries()) {
+      const difference = findFirstConfigDifference(entry, expected[index], `${path}[${index}]`);
+      if (difference) {
+        return difference;
+      }
+    }
+    return undefined;
+  }
+
+  const storedRecord = optionalRecord(stored);
+  const expectedRecord = optionalRecord(expected);
+  if (storedRecord || expectedRecord) {
+    if (!storedRecord || !expectedRecord) {
+      return path;
+    }
+    for (const key of [...new Set([...Object.keys(storedRecord), ...Object.keys(expectedRecord)])].sort()) {
+      if (!(key in storedRecord)) {
+        return `${path}.${key} (not stored)`;
+      }
+      if (!(key in expectedRecord)) {
+        return `${path}.${key} (missing from previousConfig)`;
+      }
+      const difference = findFirstConfigDifference(storedRecord[key], expectedRecord[key], `${path}.${key}`);
+      if (difference) {
+        return difference;
+      }
+    }
+    return undefined;
+  }
+
+  return stored === expected ? undefined : path;
+}

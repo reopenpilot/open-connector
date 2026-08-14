@@ -1,7 +1,8 @@
 import type { HomeAssistantActionContext, HomeAssistantActionHandler } from "./runtime.ts";
 
 import { optionalRecord, optionalString, optionalStringOrNull, requiredRecord } from "../../core/cast.ts";
-import { badHomeAssistantRequest, requestHomeAssistantJson } from "./runtime.ts";
+import { ProviderRequestError } from "../provider-runtime.ts";
+import { assertStoredConfigMatches, badHomeAssistantRequest, requestHomeAssistantJson } from "./runtime.ts";
 
 /**
  * One editable Home Assistant config domain served by `/api/config/<component>/config/<key>`.
@@ -88,7 +89,16 @@ async function writeConfig(
   // The key travels in the path; Home Assistant injects it into the stored
   // entry itself, so the body is the bare config object.
   const path = buildConfigPath(domain, input);
+  const previousConfig = requiredRecord(input.previousConfig, "previousConfig", badHomeAssistantRequest);
   const config = requiredRecord(input.config, "config", badHomeAssistantRequest);
+
+  assertStoredConfigMatches({
+    stored: await readStoredConfig(path, context),
+    previous: previousConfig,
+    subject: `this ${domain.component}`,
+    readActionName: `get_${domain.component}_config`,
+  });
+
   return {
     result: readConfigResult(
       await requestHomeAssistantJson({
@@ -99,6 +109,25 @@ async function writeConfig(
       }),
     ),
   };
+}
+
+/**
+ * Read the configuration this key currently stores, treating a key that has
+ * none as an empty document.
+ *
+ * Posting to an unused key is how an entry is created, so "not stored yet" is a
+ * normal state here rather than an error, and a caller creating one passes an
+ * empty object.
+ */
+async function readStoredConfig(path: string, context: HomeAssistantActionContext): Promise<Record<string, unknown>> {
+  try {
+    return optionalRecord(await requestHomeAssistantJson({ context, path, method: "GET" })) ?? {};
+  } catch (error) {
+    if (error instanceof ProviderRequestError && error.status === 404) {
+      return {};
+    }
+    throw error;
+  }
 }
 
 async function removeConfig(

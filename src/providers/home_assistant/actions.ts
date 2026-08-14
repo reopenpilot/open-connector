@@ -139,6 +139,11 @@ function registryListSchema(description: string): JsonSchema {
 const configAdminNote =
   "Requires an admin access token, and only covers entries stored in the Home Assistant UI-editable config; entries defined in other YAML files return not found.";
 
+// Every save through the config store replaces the stored entry rather than
+// merging into it, so the entry that was read has to come back with the write.
+const configPreviousNote =
+  "The configuration that was read must be sent back unchanged as previousConfig: the write is refused unless it still matches what is stored, which is what stops an edit made without reading from dropping the parts it never saw.";
+
 const configWriteResultSchema = s.actionOutput(
   { result: s.string("The Home Assistant result status, normally ok.") },
   "The Home Assistant config write result.",
@@ -152,9 +157,12 @@ function configSaveInput(field: string, description: string, configDescription: 
   return s.actionInput(
     {
       [field]: s.nonEmptyString(description),
+      previousConfig: s.looseObject(
+        "The configuration this entry stored when it was read, exactly as the matching get action returned it. Send an empty object to create a new entry.",
+      ),
       config: s.looseObject(configDescription),
     },
-    [field, "config"],
+    [field, "previousConfig", "config"],
     "Input parameters for saving one config entry.",
   );
 }
@@ -517,7 +525,7 @@ export const homeAssistantActions: ActionDefinition[] = [
   }),
   defineProviderAction(service, {
     name: "save_automation_config",
-    description: `Create or replace one Home Assistant automation. Posting to an unused id creates the automation. ${configAdminNote}`,
+    description: `Create or replace one Home Assistant automation. Posting to an unused id creates the automation. ${configPreviousNote} ${configAdminNote}`,
     followUpActions: ["home_assistant.get_automation_config", "home_assistant.get_logbook"],
     inputSchema: configSaveInput(
       "automationId",
@@ -541,7 +549,7 @@ export const homeAssistantActions: ActionDefinition[] = [
   }),
   defineProviderAction(service, {
     name: "save_script_config",
-    description: `Create or replace one Home Assistant script. Posting to an unused key creates the script. ${configAdminNote}`,
+    description: `Create or replace one Home Assistant script. Posting to an unused key creates the script. ${configPreviousNote} ${configAdminNote}`,
     followUpActions: ["home_assistant.get_script_config"],
     inputSchema: configSaveInput(
       "scriptKey",
@@ -565,7 +573,7 @@ export const homeAssistantActions: ActionDefinition[] = [
   }),
   defineProviderAction(service, {
     name: "save_scene_config",
-    description: `Create or replace one Home Assistant scene. Posting to an unused id creates the scene. ${configAdminNote}`,
+    description: `Create or replace one Home Assistant scene. Posting to an unused id creates the scene. ${configPreviousNote} ${configAdminNote}`,
     followUpActions: ["home_assistant.get_scene_config"],
     inputSchema: configSaveInput(
       "sceneId",
@@ -903,14 +911,17 @@ export const homeAssistantActions: ActionDefinition[] = [
   }),
   defineProviderAction(service, {
     name: "save_lovelace_config",
-    description: `Replace the stored configuration of one Lovelace dashboard. This overwrites the whole document rather than merging, so read the current configuration with get_lovelace_config, change what is needed, and send the complete result back. Everything omitted is lost. ${lovelaceAdminNote} ${lovelaceDefaultDashboardNote}`,
+    description: `Replace the stored configuration of one Lovelace dashboard. This overwrites the whole document rather than merging, so read the current configuration with get_lovelace_config, apply the change to what it returns, and send the complete result as config. Everything omitted is lost. The configuration that was read must be sent back unchanged as previousConfig: the write is refused unless it still matches what the dashboard stores, which is what stops an edit made without reading from discarding the existing views. ${lovelaceAdminNote} ${lovelaceDefaultDashboardNote}`,
     followUpActions: ["home_assistant.get_lovelace_config"],
     inputSchema: s.actionInput(
       {
         urlPath: lovelaceUrlPathSchema,
+        previousConfig: s.looseObject(
+          "The configuration this dashboard stored when it was read, exactly as get_lovelace_config returned it. Send an empty object for a dashboard that has no stored configuration yet, such as one just created.",
+        ),
         config: s.looseObject("The complete dashboard configuration to store, normally with a views list."),
       },
-      ["config"],
+      ["previousConfig", "config"],
       "Input parameters for replacing one Home Assistant dashboard configuration.",
     ),
     outputSchema: s.actionOutput(
